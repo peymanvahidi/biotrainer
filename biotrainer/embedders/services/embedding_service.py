@@ -169,7 +169,18 @@ class EmbeddingService:
             io_process.join()
 
     @staticmethod
-    def store_embedding(embeddings_file_handle, seq_record, embedding, store_by_hash: bool = True):
+    def store_embedding(embeddings_file_handle, seq_record, embedding, store_by_hash: bool = True,
+                        compression: Optional[str] = "lzf"):
+        """Store a single embedding in the given (open) h5 file handle.
+
+        The default codec is ``lzf``: a fast, lossless codec shipped with h5py.
+        float32 embeddings compress very poorly (~1.05-1.1x), so the previous
+        ``gzip`` default burned CPU in the single I/O worker for almost no disk
+        savings and stalled the GPU. ``lzf`` removes that write bottleneck while
+        keeping reads transparent (h5py decompresses any/no codec on read).
+        Pass ``compression=None`` for no compression or ``"gzip"`` to restore the
+        old behaviour.
+        """
         h5_index = seq_record.get_hash() if store_by_hash else seq_record.seq_id
 
         # Handle both torch tensors and numpy arrays
@@ -178,7 +189,7 @@ class EmbeddingService:
         else:
             embedding_data = embedding
 
-        embeddings_file_handle.create_dataset(h5_index, data=embedding_data, compression="gzip", chunks=True)
+        embeddings_file_handle.create_dataset(h5_index, data=embedding_data, compression=compression, chunks=True)
         embeddings_file_handle[h5_index].attrs["original_id"] = seq_record.seq_id
 
     def generate_embeddings(self,
