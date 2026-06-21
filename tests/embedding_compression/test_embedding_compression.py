@@ -1,13 +1,12 @@
 """
-Tests for the embedding h5 compression codec.
+Tests for the embedding h5 write codec.
 
-Background: embeddings used to be written with ``gzip``. float32 protein
-language model embeddings compress very poorly (~1.05-1.1x) while gzip is
-CPU-expensive, so the single I/O worker became the bottleneck and stalled the
-GPU. Switching to ``lzf`` (a fast, lossless codec shipped with h5py) keeps reads
-transparent while removing the write bottleneck.
-
-See ``autoeval-improvements/01-embedding-gzip-compression.md``.
+Background: embeddings were originally written with ``gzip``, then ``lzf``. float16/float32 protein
+language model embeddings compress very poorly (~5-10%) while a codec is CPU-expensive, so the single
+I/O writer became the bottleneck and stalled the GPU. The default is now ``None`` (no compression,
+contiguous storage) — the fastest lossless option on local/fast storage. ``lzf`` (fast, lossless) and
+``gzip`` remain available via the ``compression`` parameter when smaller files matter (e.g. a
+bandwidth-limited network filesystem). All options are lossless and reads are codec-transparent in h5py.
 """
 
 import os
@@ -34,7 +33,9 @@ def _make_embedding(num_residues: int, dim: int, seed: int) -> np.ndarray:
 
 
 class TestEmbeddingCompression(unittest.TestCase):
-    def test_store_embedding_defaults_to_lzf(self):
+    def test_store_embedding_defaults_to_none(self):
+        """Default codec is now None: protein-LM embeddings are nearly incompressible, so a codec
+        only burns CPU in the I/O writer and stalls the GPU. None writes contiguously (no chunking)."""
         seq_record = BiotrainerSequenceRecord(seq_id="seq_0", seq="MAAGVKL")
         embedding = _make_embedding(num_residues=16, dim=32, seed=0)
 
@@ -44,7 +45,51 @@ class TestEmbeddingCompression(unittest.TestCase):
                 EmbeddingService.store_embedding(handle, seq_record, embedding, store_by_hash=False)
 
             with h5py.File(path, "r") as handle:
-                self.assertEqual(handle["seq_0"].compression, "lzf")
+                self.assertIsNone(handle["seq_0"].compression)
+                self.assertIsNone(handle["seq_0"].chunks)  # contiguous storage
+
+    def test_none_round_trip_is_lossless(self):
+        """The new default (no codec) must reproduce the embedding bit-for-bit through the load path."""
+        seq_record = BiotrainerSequenceRecord(seq_id="seq_0", seq="MAAGVKLPQ")
+        embedding = _make_embedding(num_residues=128, dim=256, seed=11)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "embeddings.h5")
+            with h5py.File(path, "w") as handle:
+                EmbeddingService.store_embedding(handle, seq_record, embedding, store_by_hash=False)
+
+            loaded = EmbeddingService.load_embeddings(path)
+
+        self.assertIn("seq_0", loaded)
+        np.testing.assert_array_equal(loaded["seq_0"].numpy(), embedding)
+
+    def test_none_is_faster_than_lzf(self):
+        """The new default (None) must write at least as fast as lzf (it skips compression entirely)."""
+        num_sequences, num_residues, dim = 24, 320, 1024
+        embeddings = [
+            (BiotrainerSequenceRecord(seq_id=f"seq_{i}", seq="MAAGV"),
+             _make_embedding(num_residues=num_residues, dim=dim, seed=i))
+            for i in range(num_sequences)
+        ]
+
+        def store_all(file_path, compression):
+            start = time.perf_counter()
+            with h5py.File(file_path, "w") as handle:
+                for seq_record, emb in embeddings:
+                    EmbeddingService.store_embedding(handle, seq_record, emb,
+                                                     store_by_hash=False, compression=compression)
+            return time.perf_counter() - start
+
+        with tempfile.TemporaryDirectory() as tmp:
+            none_time = store_all(os.path.join(tmp, "none.h5"), None)
+            lzf_time = store_all(os.path.join(tmp, "lzf.h5"), "lzf")
+
+        print(f"\n[embedding-compression] none={none_time:.3f}s lzf={lzf_time:.3f}s "
+              f"(none {lzf_time / none_time:.1f}x faster)")
+        # Tolerance guards against scheduler/write-back jitter on shared cluster nodes; the real gap is large.
+        self.assertLessEqual(none_time, lzf_time * 1.25,
+                             f"Expected None to write at least as fast as lzf (within noise), "
+                             f"but none={none_time:.3f}s vs lzf={lzf_time:.3f}s")
 
     def test_lzf_round_trip_is_lossless(self):
         """lzf must reproduce the embedding bit-for-bit and stay readable through

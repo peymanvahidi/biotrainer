@@ -212,30 +212,61 @@ def _setup_embedding_functions(embedder_name,
 
         return precomputed_per_res, precomputed_per_seq
 
-    # No custom embedding functions -> Biotrainer Embedding Service
+    # No custom embedding functions -> Biotrainer Embedding Service.
+    # Construct the service LAZILY: on a cached/resumed run both target h5 files already exist and
+    # compute_embeddings would early-return without ever touching the model, so eagerly loading the
+    # multi-GB embedder here only wastes a disk load + .to(device) transfer + several GB of VRAM
+    # reservation (which can also contend with resumed training tasks). We therefore build the
+    # service only when at least one target file is actually missing, mirroring the os.path.exists()
+    # guard already used on the custom-embedding-function branch below. The h5 path is computed with
+    # the exact helper compute_embeddings uses. For HuggingFace/optimized (ProtT5/ProstT5/ESM2) and
+    # predefined embedders the service's .name equals the passed embedder_name, so the existence check
+    # and the returned path string match compute_embeddings exactly and the optimization fires. ONNX is
+    # the one case where .name differs ("onnx-<stem>" vs the ".onnx" path): there the pre-computed path
+    # never matches the file compute_embeddings actually writes, so this short-circuit simply never
+    # fires and we fall back to the original eager path -- correct output, just no resume speedup for
+    # ONNX. In all cases outputs stay byte-identical; fresh runs are unaffected.
     assert (custom_embedding_function_per_residue is None) == (custom_embedding_function_per_sequence is None)
     if not custom_embedding_function_per_residue and not custom_embedding_function_per_sequence:
-        embedding_service: EmbeddingService = get_embedding_service(embedder_name=embedder_name,
-                                                                    custom_tokenizer_config=custom_tokenizer_config,
-                                                                    use_half_precision=use_half_precision,
-                                                                    device=get_device(device)
-                                                                    )
-        embedding_function_per_residue = lambda seqs: embedding_service.compute_embeddings(input_data=seqs,
-                                                                                           output_dir=output_dir,
-                                                                                           protocol=
-                                                                                           Protocol.using_per_residue_embeddings()[
-                                                                                               0],
-                                                                                           force_recomputing=False,
-                                                                                           force_output_dir=True
-                                                                                           )
-        embedding_function_per_sequence = lambda seqs: embedding_service.compute_embeddings(input_data=seqs,
-                                                                                            output_dir=output_dir,
-                                                                                            protocol=
-                                                                                            Protocol.using_per_sequence_embeddings()[
-                                                                                                0],
-                                                                                            force_recomputing=False,
-                                                                                            force_output_dir=True
-                                                                                            )
+        per_residue_protocol = Protocol.using_per_residue_embeddings()[0]
+        per_sequence_protocol = Protocol.using_per_sequence_embeddings()[0]
+        per_residue_path = EmbeddingService.get_embeddings_file_path(output_dir=output_dir,
+                                                                     protocol=per_residue_protocol,
+                                                                     embedder_name=embedder_name,
+                                                                     use_half_precision=use_half_precision,
+                                                                     force_output_dir=True)
+        per_sequence_path = EmbeddingService.get_embeddings_file_path(output_dir=output_dir,
+                                                                      protocol=per_sequence_protocol,
+                                                                      embedder_name=embedder_name,
+                                                                      use_half_precision=use_half_precision,
+                                                                      force_output_dir=True)
+
+        embedding_service_holder = {}
+
+        def _get_or_create_embedding_service() -> EmbeddingService:
+            if "service" not in embedding_service_holder:
+                embedding_service_holder["service"] = get_embedding_service(
+                    embedder_name=embedder_name,
+                    custom_tokenizer_config=custom_tokenizer_config,
+                    use_half_precision=use_half_precision,
+                    device=get_device(device))
+            return embedding_service_holder["service"]
+
+        def _compute_or_reuse_embeddings(seqs, protocol: Protocol, embeddings_file_path: Path) -> str:
+            # Resumed/cached run: file already present -> reuse it without loading the model.
+            if embeddings_file_path.is_file():
+                print(f"Using existing embeddings file at {embeddings_file_path}")
+                return str(embeddings_file_path)
+            return _get_or_create_embedding_service().compute_embeddings(input_data=seqs,
+                                                                         output_dir=output_dir,
+                                                                         protocol=protocol,
+                                                                         force_recomputing=False,
+                                                                         force_output_dir=True)
+
+        embedding_function_per_residue = lambda seqs: _compute_or_reuse_embeddings(seqs, per_residue_protocol,
+                                                                                   per_residue_path)
+        embedding_function_per_sequence = lambda seqs: _compute_or_reuse_embeddings(seqs, per_sequence_protocol,
+                                                                                    per_sequence_path)
         return embedding_function_per_residue, embedding_function_per_sequence
 
     # Custom embedding functions -> Use wrapper

@@ -29,7 +29,10 @@ def setup_pipeline(data_handler: AutoEvalDataHandler,
         custom_storage_path=custom_storage_path)
 
     if force_download:
-        data_handler.clear_autoeval_cache()
+        # Refresh only the requested framework. Previously this wiped the entire autoeval cache
+        # (every framework), forcing redundant re-downloads + re-preprocessing of unrelated
+        # frameworks on the next run.
+        data_handler.clear_framework_cache(custom_storage_path=custom_storage_path)
 
     if not os.path.exists(framework_base_path):
         os.makedirs(framework_base_path, exist_ok=True)

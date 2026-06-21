@@ -109,6 +109,17 @@ class AutoEvalDataHandler(ABC):
     def clear_autoeval_cache():
         shutil.rmtree(Path(user_cache_dir('biotrainer')) / "autoeval", ignore_errors=True)
 
+    def clear_framework_cache(self, custom_storage_path: Optional[Union[str, Path]] = None):
+        """Remove only this framework's cached (downloaded + preprocessed) data.
+
+        Used by ``force_download`` to refresh a single framework. Previously the whole
+        ``autoeval`` cache was wiped, which destroyed every other framework's data and forced
+        redundant re-downloads of unrelated frameworks. The framework's own reference file lives
+        under this base path, so it is correctly refreshed too.
+        """
+        shutil.rmtree(self.get_framework_base_path(custom_storage_path=custom_storage_path),
+                      ignore_errors=True)
+
     def get_framework_base_path(self, custom_storage_path: Optional[Union[str, Path]] = None) -> Path:
         if custom_storage_path:
             return Path(custom_storage_path) / self.get_framework_name()

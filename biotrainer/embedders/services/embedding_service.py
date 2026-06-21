@@ -4,7 +4,8 @@ import os
 import time
 import h5py
 import torch
-import multiprocessing as mp
+import queue as queue_lib
+import threading
 
 from tqdm import tqdm
 from pathlib import Path
@@ -17,19 +18,6 @@ from ...utilities import get_logger, is_running_in_notebook
 from ...input_files import read_FASTA, BiotrainerSequenceRecord
 
 logger = get_logger(__name__)
-
-
-def _io_worker_process(queue: mp.Queue, file_path: Path, store_by_hash: bool):
-    """ Parallel process to store embeddings to h5 file while computing embeddings """
-    import h5py  # local import to ensure availability in spawned process
-
-    with h5py.File(file_path, "a") as embeddings_file:
-        # Iterate over items from the queue until the sentinel None is received
-        for item in iter(queue.get, None):
-            seq_record, embedding_np = item
-            EmbeddingService.store_embedding(
-                embeddings_file, seq_record, embedding_np, store_by_hash
-            )
 
 
 class EmbeddingService:
@@ -70,7 +58,8 @@ class EmbeddingService:
                            protocol: Protocol,
                            force_output_dir: bool = False,
                            force_recomputing: bool = False,
-                           store_by_hash: bool = True) -> str:
+                           store_by_hash: bool = True,
+                           compression: Optional[str] = None) -> str:
         """
         Compute embeddings with the provided embedder from a sequence file or a dictionary of sequences.
 
@@ -81,6 +70,11 @@ class EmbeddingService:
             force_output_dir (bool): If True, the given output directory is directly used to store the embeddings file.
             force_recomputing (bool): If True, the embedding file is re-computed, even if it already exists.
             store_by_hash (bool): If True, sequence hashes are used as indices for the h5 result file.
+            compression (Optional[str]): h5 codec for the stored embeddings. Default ``None`` (no
+                compression). Protein-LM embeddings are nearly incompressible (~5-10%), so a codec
+                mostly burns CPU in the I/O writer and back-pressures the GPU for almost no disk
+                saving. ``"lzf"`` (fast, lossless) or ``"gzip"`` remain available when smaller files
+                are needed (e.g. a bandwidth-limited network filesystem). All options are lossless.
 
         Returns:
             str: Path to the generated output h5 embeddings file.
@@ -122,6 +116,7 @@ class EmbeddingService:
             embeddings_file_path=embeddings_file_path,
             use_reduced_embeddings=use_reduced_embeddings,
             store_by_hash=store_by_hash,
+            compression=compression,
         )
 
         end_time = time.time()
@@ -133,19 +128,62 @@ class EmbeddingService:
                                      seq_records: List[BiotrainerSequenceRecord],
                                      embeddings_file_path: Path,
                                      use_reduced_embeddings: bool,
-                                     store_by_hash: bool):
+                                     store_by_hash: bool,
+                                     compression: Optional[str] = None,
+                                     queue_size: int = 64):
         """
-        Use separate process for I/O and run embedding on main process/GPU.
-        """
-        ctx = mp.get_context('spawn')
-        embedding_queue = ctx.Queue(maxsize=30)
+        Run embedding on the main thread/GPU and hand finished embeddings to a single
+        background **thread** that writes them to the h5 file.
 
-        # Start single I/O worker
-        io_process = mp.Process(
-            target=_io_worker_process,
-            args=(embedding_queue, embeddings_file_path, store_by_hash)
-        )
-        io_process.start()
+        A thread (not a process) is used deliberately:
+          * it shares memory with the producer, so embeddings are handed over by reference
+            instead of being pickled through a pipe (large per-residue tensors are expensive
+            to serialise);
+          * h5py releases the GIL during the HDF5 write/compress, so the write genuinely
+            overlaps with GPU compute;
+          * it is portable (no fork/spawn semantics) and cannot deadlock the way forking a
+            CUDA-initialised, multi-threaded process can.
+
+        The writer always drains the queue (so the producer can never block on a dead writer)
+        and the first writer error is re-raised after the join instead of being swallowed.
+        """
+        write_queue: queue_lib.Queue = queue_lib.Queue(maxsize=queue_size)
+        writer_error: List[BaseException] = []
+        writer_failed = threading.Event()
+
+        def _writer():
+            err: Optional[BaseException] = None
+            embeddings_file = None
+            try:
+                embeddings_file = h5py.File(embeddings_file_path, "a")
+            except BaseException as e:  # noqa: could not open output file
+                err = e
+                writer_failed.set()
+            # Always consume until the sentinel so the producer can never block on a dead writer.
+            for item in iter(write_queue.get, None):
+                if err is not None:
+                    # Keep DRAINING (not break) after an error: this is the load-bearing invariant
+                    # that prevents the producer from blocking forever on a full queue when the
+                    # writer has failed. The writer_failed Event below is only a GPU-time optimisation.
+                    continue
+                seq_record, embedding_np = item
+                try:
+                    EmbeddingService.store_embedding(
+                        embeddings_file, seq_record, embedding_np, store_by_hash, compression
+                    )
+                except BaseException as e:  # noqa: record first error, keep draining
+                    err = e
+                    writer_failed.set()
+            if embeddings_file is not None:
+                try:
+                    embeddings_file.close()
+                except BaseException as e:  # noqa
+                    err = err or e
+            if err is not None:
+                writer_error.append(err)
+
+        writer = threading.Thread(target=_writer, name="embedding-io-writer", daemon=True)
+        writer.start()
 
         try:
             for seq_record, embedding in tqdm(
@@ -154,32 +192,29 @@ class EmbeddingService:
                     desc="Computing Embeddings",
                     disable=is_running_in_notebook()
             ):
-                # Convert to numpy and move to CPU before putting in queue
+                if writer_failed.is_set():
+                    break  # writer died; stop wasting GPU time, the error is re-raised below
+                # Move to CPU/numpy on the producer; the writer thread only does I/O.
                 embedding_np = embedding.cpu().numpy()
-
-                embedding_queue.put((
-                    seq_record,
-                    embedding_np,
-                ))
-
-            # Signal worker to stop after embeddings are computed
-            embedding_queue.put(None)
-
+                write_queue.put((seq_record, embedding_np))
         finally:
-            io_process.join()
+            write_queue.put(None)  # sentinel: let the writer drain and exit
+            writer.join()
+
+        if writer_error:
+            raise writer_error[0]
 
     @staticmethod
     def store_embedding(embeddings_file_handle, seq_record, embedding, store_by_hash: bool = True,
-                        compression: Optional[str] = "lzf"):
+                        compression: Optional[str] = None):
         """Store a single embedding in the given (open) h5 file handle.
 
-        The default codec is ``lzf``: a fast, lossless codec shipped with h5py.
-        float32 embeddings compress very poorly (~1.05-1.1x), so the previous
-        ``gzip`` default burned CPU in the single I/O worker for almost no disk
-        savings and stalled the GPU. ``lzf`` removes that write bottleneck while
-        keeping reads transparent (h5py decompresses any/no codec on read).
-        Pass ``compression=None`` for no compression or ``"gzip"`` to restore the
-        old behaviour.
+        ``compression`` defaults to ``None`` (no codec, contiguous storage). Protein-LM
+        embeddings are nearly incompressible (~5-10%), so a codec mostly burns CPU in the
+        single I/O writer and stalls the GPU for almost no disk saving. ``None`` is the
+        fastest option on local/fast storage. Pass ``"lzf"`` (fast, lossless) or ``"gzip"``
+        when smaller files matter (e.g. a bandwidth-limited network filesystem). All options
+        are lossless and reads are codec-transparent in h5py.
         """
         h5_index = seq_record.get_hash() if store_by_hash else seq_record.seq_id
 
@@ -189,7 +224,10 @@ class EmbeddingService:
         else:
             embedding_data = embedding
 
-        embeddings_file_handle.create_dataset(h5_index, data=embedding_data, compression=compression, chunks=True)
+        # Chunking is only required for compression filters; contiguous is fastest for raw writes.
+        chunks = True if compression is not None else None
+        embeddings_file_handle.create_dataset(h5_index, data=embedding_data,
+                                              compression=compression, chunks=chunks)
         embeddings_file_handle[h5_index].attrs["original_id"] = seq_record.seq_id
 
     def generate_embeddings(self,
