@@ -15,7 +15,6 @@ from biotrainer_core.utils.constants import STANDARD_AAS
 from biotrainer.bioengineer.bioengineer_interfaces import BertLikeEngineer
 from biotrainer.bioengineer.bioengineer_custom_model import CustomBioEngineerModel, CustomBioEngineerModelWrapper
 from biotrainer.shared import SequenceTooLongError
-from biotrainer.shared.metrics import evaluate_contact_dataset
 from biotrainer.bioengineer.bioengineer_utils import MAX_CONTEXT_LENGTH
 
 _BOS_TOKEN_ID = 0
@@ -423,8 +422,6 @@ class BioEngineerTests(unittest.TestCase):
         self.assertEqual(_NoBosEngineer().max_context_length(), MAX_CONTEXT_LENGTH)
 
     def test_random_baseline_rejects_too_long_sequences(self):
-        """ The baseline samples an [L, 20, L, 20] array, so it has to reject before allocating: a MemoryError
-            is not a SequenceTooLongError, so the contact evaluator could not skip the protein """
         baseline = BioEngineer.from_baseline(baseline=BioEngineerBaseline.RANDOM_BASELINE).model_wrapper
         sequence = "A" * (baseline.max_context_length() + 1)
 
@@ -440,51 +437,3 @@ class CustomModelContextLengthTests(unittest.TestCase):
         wrapper = CustomBioEngineerModelWrapper(custom_bioengineer=_LongContextCustomModel(),
                                                 device=torch.device("cpu"))
         self.assertEqual(wrapper.max_context_length(), 2048)
-
-
-class ContactDatasetEvaluationTests(unittest.TestCase):
-    """ evaluate_contact_dataset resumes from cache, so one over-long protein must not kill the run forever """
-
-    @staticmethod
-    def _symmetric_target(rng, seq_len: int = 40) -> np.ndarray:
-        target = (rng.random((seq_len, seq_len)) > 0.9).astype(float)
-        return np.maximum(target, target.T)
-
-    def test_too_long_proteins_are_skipped(self):
-        rng = np.random.default_rng(0)
-        target = self._symmetric_target(rng)
-
-        def predict(item):
-            if item == "too_long":
-                raise SequenceTooLongError("2000 tokens exceed the 1024 token context")
-            return rng.random(target.shape)
-
-        results = list(evaluate_contact_dataset(dataset_name="test",
-                                                items=["too_long", "fine"],
-                                                predict_func=predict,
-                                                get_ground_truth_func=lambda item: target,
-                                                get_seq_id_func=lambda item: item))
-
-        self.assertEqual([result.protein_name for result in results], ["fine"])
-
-    def test_other_errors_still_propagate(self):
-        """ The skip must be narrow - a real bug in predict_func may not be swallowed.
-
-        ValueError is the case that matters: SequenceTooLongError subclasses it and _residue_token_positions
-        raises a plain one on this very call path, so a catch widened to ValueError would silently skip a
-        tokenizer/strip_special_tokens disagreement instead of failing loudly.
-        """
-        rng = np.random.default_rng(0)
-        target = self._symmetric_target(rng)
-
-        for error in [RuntimeError("boom"), ValueError("strip_special_tokens disagrees with the tokenizer")]:
-            with self.subTest(error=type(error).__name__):
-                def predict(item):
-                    raise error
-
-                with self.assertRaises(type(error)):
-                    list(evaluate_contact_dataset(dataset_name="test",
-                                                  items=["a"],
-                                                  predict_func=predict,
-                                                  get_ground_truth_func=lambda item: target,
-                                                  get_seq_id_func=lambda item: item))

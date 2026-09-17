@@ -400,7 +400,7 @@ class BertLikeEngineer(BioEngineerModelWrapper, ABC):
             raise SequenceTooLongError(
                 f"Sequence of {len(sequence)} residues tokenizes to {n_tokens} tokens, which exceeds the "
                 f"{self.max_context_length()} token context of {self._name}. The categorical Jacobian has no "
-                f"windowed variant - contacts spanning two windows would be missing - so it is not computed."
+                f"windowed variant and contacts spanning two windows would be missing, so it is not computed."
             )
         # Which token positions hold the actual residues - no BOS/EOS arrangement is assumed
         residue_positions = self._residue_token_positions(input_ids, sequence)
